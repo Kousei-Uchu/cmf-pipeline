@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CMF Pipeline</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,640&family=Outfit:wght@380;500;650&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="grain" aria-hidden="true"></div>
+    <header class="top">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <div>
+          <p class="eyebrow">Personal media pipeline</p>
+          <h1>CMF</h1>
+        </div>
+      </div>
+      <div class="health" id="health" data-state="checking">checking tools…</div>
+    </header>
+
+    <main class="layout">
+      <section class="search-pane">
+        <form id="search-form" class="search">
+          <label class="sr" for="q">Search or paste a URL</label>
+          <input
+            id="q"
+            name="query"
+            autocomplete="off"
+            placeholder="Search Innertube / Spotify, or paste a URL"
+          />
+          <button type="submit">Look up</button>
+        </form>
+        <p class="hint" id="search-hint">
+          YouTube, YouTube Music, and most yt-dlp URLs work out of the box. Spotify URLs need client credentials in
+          <code>.env</code>.
+        </p>
+        <div id="groups" class="groups"></div>
+      </section>
+
+      <aside class="inspector" id="inspector">
+        <div class="empty-inspect" id="empty-inspect">
+          <p>Select a result to inspect metadata, pick a delivery mode, and pack a <strong>.cmf</strong> archive.</p>
+        </div>
+        <div class="inspect-body hidden" id="inspect-body"></div>
+      </aside>
+    </main>
+
+    <section class="dock hidden" id="dock">
+      <div class="dock-head">
+        <h2>Run</h2>
+        <p id="dock-status">Idle</p>
+      </div>
+      <pre id="log" class="log"></pre>
+      <div class="dock-actions" id="dock-actions"></div>
+    </section>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
