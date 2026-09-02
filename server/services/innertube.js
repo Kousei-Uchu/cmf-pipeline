@@ -1,17 +1,30 @@
 import { Innertube } from 'youtubei.js';
 import { parseClockDuration, parseArtistTitle, stripTitleNoise, cleanArtistName } from '../lib/text.js';
+import { child } from '../lib/logger.js';
+
+const log = child('innertube');
 
 let clientPromise = null;
 
 export async function innertube() {
   if (!clientPromise) {
+    log.debug('innertube: no cached client, creating a new Innertube session');
+    const end = log.time('Innertube.create');
     clientPromise = Innertube.create({
-      retrieve_player: false,
-      generate_session_locally: true,
-    }).catch((err) => {
-      clientPromise = null;
-      throw err;
-    });
+    })
+      .then((client) => {
+        end();
+        log.debug('innertube: session ready');
+        return client;
+      })
+      .catch((err) => {
+        end({ failed: true });
+        log.error('innertube: session creation failed', { message: err.message });
+        clientPromise = null;
+        throw err;
+      });
+  } else {
+    log.debug('innertube: reusing cached client session');
   }
   return clientPromise;
 }
@@ -98,29 +111,44 @@ function collectMedia(node, acc = []) {
 }
 
 export async function searchYouTube(query, { type = 'all' } = {}) {
+  log.debug('searchYouTube: start', { query, type });
+  const end = log.time('searchYouTube', { query });
   const yt = await innertube();
   const videos = [];
   const music = [];
 
   try {
-    const res = await yt.search(query, type === 'video' ? { type: 'video' } : undefined);
-    for (const row of collectMedia(res.results)) {
+    const searchEnd = log.time('yt.music.search (video)', { query });
+    const res = await yt.music.search(query, type === 'video' ? { type: 'video' } : undefined);
+    const rows = collectMedia(res.results);
+    log.debug('searchYouTube: raw video search rows', { query, rowCount: rows.length });
+    for (const row of rows) {
       const mapped = asItem(row, 'video');
       if (mapped) videos.push(mapped);
     }
-  } catch {
-    // Innertube search can flake; yt-dlp ytsearch is the fallback in resolve.
+    searchEnd({ mappedCount: videos.length });
+  } catch (err) {
+    log.warn('searchYouTube: yt.music.search failed, will rely on yt-dlp fallback in resolve.js', {
+      query,
+      message: err.message,
+    });
   }
 
   try {
-    const m = await yt.music.search(query);
+    const musicEnd = log.time('yt.music.search (song)', { query });
+    const m = await yt.music.search(query, { type: 'song'});
     const rows = collectMedia(m.songs?.contents).concat(collectMedia(m.videos?.contents));
+    log.debug('searchYouTube: raw music search rows', { query, rowCount: rows.length });
     for (const row of rows) {
       const mapped = asItem(row, row.item_type === 'video' ? 'video' : 'song');
       if (mapped) music.push(mapped);
     }
-  } catch {
-    // music.search is optional
+    musicEnd({ mappedCount: music.length });
+  } catch (err) {
+    log.debug('searchYouTube: yt.music.search unavailable/failed (optional)', {
+      query,
+      message: err.message,
+    });
   }
 
   const seen = new Set();
@@ -130,16 +158,20 @@ export async function searchYouTube(query, { type = 'all' } = {}) {
     seen.add(it.youtube_id);
     items.push(it);
   }
+  end({ videoCount: videos.length, musicCount: music.length, dedupedCount: items.length });
   return { items, videos, music };
 }
 
 export async function getVideoDetails(youtubeId) {
+  log.debug('getVideoDetails: start', { youtubeId });
+  const end = log.time('getVideoDetails', { youtubeId });
   const yt = await innertube();
   const info = await yt.getBasicInfo(youtubeId);
   const basic = info.basic_info || {};
   const rawTitle = basic.title || '';
   const channel = basic.author || basic.channel?.name || '';
   const parsed = parseArtistTitle(rawTitle, channel);
+  end({ rawTitle, channel });
   return {
     id: `youtube:${youtubeId}`,
     source: 'youtube',
@@ -173,20 +205,31 @@ export function parseYouTubeUrl(input) {
   try {
     parsed = new URL(String(input).trim());
   } catch {
+    log.debug('parseYouTubeUrl: not a valid URL', { input });
     return null;
   }
-  if (!YT_HOSTS.has(parsed.hostname)) return null;
+  if (!YT_HOSTS.has(parsed.hostname)) {
+    log.debug('parseYouTubeUrl: unrecognized host', { input, hostname: parsed.hostname });
+    return null;
+  }
+  let result = null;
   if (parsed.hostname.includes('youtu.be')) {
     const id = parsed.pathname.split('/').filter(Boolean)[0];
-    return id ? { kind: 'video', id } : null;
+    result = id ? { kind: 'video', id } : null;
+  } else {
+    const list = parsed.searchParams.get('list');
+    const v = parsed.searchParams.get('v');
+    if (parsed.pathname.startsWith('/playlist') && list) result = { kind: 'playlist', id: list };
+    else if (v) result = { kind: 'video', id: v, list };
+    else {
+      const shorts = parsed.pathname.match(/\/shorts\/([^/?]+)/);
+      if (shorts) result = { kind: 'video', id: shorts[1] };
+      else {
+        const channel = parsed.pathname.match(/\/(channel|c|@)\/([^/?]+)/);
+        if (channel) result = { kind: 'channel', id: channel[2] };
+      }
+    }
   }
-  const list = parsed.searchParams.get('list');
-  const v = parsed.searchParams.get('v');
-  if (parsed.pathname.startsWith('/playlist') && list) return { kind: 'playlist', id: list };
-  if (v) return { kind: 'video', id: v, list };
-  const shorts = parsed.pathname.match(/\/shorts\/([^/?]+)/);
-  if (shorts) return { kind: 'video', id: shorts[1] };
-  const channel = parsed.pathname.match(/\/(channel|c|@)\/([^/?]+)/);
-  if (channel) return { kind: 'channel', id: channel[2] };
-  return null;
+  log.debug('parseYouTubeUrl', { input, result });
+  return result;
 }

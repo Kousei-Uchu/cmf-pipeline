@@ -68,6 +68,16 @@ Identical file contents (same SHA-256) are stored once in the zip; later copies 
 
 Candidates are scored on title similarity, artist/channel, duration, official-video vs lyric/live penalties, and (when both audio and video are requested) RMS-envelope correlation of the first ~30 seconds. YouTube Music “Artist - Topic” / “Official Audio” names are cleaned before packing.
 
+## Logging
+
+Set `LOG_LEVEL=debug` (or `DEBUG=1`) in `.env` or the environment to get a full trace of everything the server does: every HTTP request/response (with a shared request id), every yt-dlp/ffmpeg/ffprobe subprocess invocation (exact argv, every stdout/stderr chunk, exit code, duration), every Spotify/Innertube HTTP call and its timing, every job's internal steps (candidate search, scoring breakdown per candidate, waveform correlation, download attempts and rejections), and archive packing. Secrets (Spotify client secret, bearer tokens) are always redacted from log output regardless of level.
+
+```bash
+LOG_LEVEL=debug npm start
+```
+
+Default level is `info`, which only logs startup and real warnings/errors — safe for normal use. Levels: `error`, `warn`, `info`, `debug`.
+
 ## API
 
 | Method | Path | Purpose |

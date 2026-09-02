@@ -166,6 +166,55 @@ code {
   margin-top: 28px;
 }
 
+.download-all-bar {
+  display: grid;
+  grid-template-columns: 56px 1fr auto;
+  align-items: center;
+  gap: 16px;
+  background: rgba(24, 20, 16, 0.72);
+  border: 1px solid var(--accent-2);
+  border-radius: 16px;
+  padding: 14px 16px;
+}
+
+.download-all-bar img {
+  width: 56px;
+  height: 56px;
+  border-radius: 10px;
+  object-fit: cover;
+}
+
+.download-all-bar .meta h2 {
+  font-family: Fraunces, serif;
+  font-size: 18px;
+  margin: 2px 0;
+}
+
+.download-all-bar button {
+  font: inherit;
+  font-weight: 650;
+  border: 0;
+  border-radius: 14px;
+  padding: 14px 18px;
+  background: var(--accent);
+  color: #fff8ef;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.download-all-bar button:hover {
+  filter: brightness(1.08);
+}
+
+@media (max-width: 520px) {
+  .download-all-bar {
+    grid-template-columns: 44px 1fr;
+  }
+  .download-all-bar button {
+    grid-column: 1 / -1;
+  }
+}
+
 .group h2 {
   font-family: Fraunces, serif;
   font-size: 22px;

@@ -16,6 +16,6 @@
     "archiver": "^7.0.1",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
-    "youtubei.js": "^16.0.1"
+    "youtubei.js": "^18.0.0"
   }
 }

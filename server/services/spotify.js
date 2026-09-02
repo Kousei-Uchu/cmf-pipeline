@@ -1,10 +1,16 @@
+import { child } from '../lib/logger.js';
+
+const log = child('spotify');
+
 const TOKEN_URL = 'https://accounts.spotify.com/api/token';
 const API = 'https://api.spotify.com/v1';
 
 let cached = { token: null, expiresAt: 0 };
 
 export function spotifyConfigured() {
-  return Boolean(process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET);
+  const configured = Boolean(process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET);
+  log.debug('spotifyConfigured', { configured });
+  return configured;
 }
 
 export function parseSpotifyUrl(input) {
@@ -15,24 +21,38 @@ export function parseSpotifyUrl(input) {
   try {
     parsed = new URL(url);
   } catch {
+    log.debug('parseSpotifyUrl: not a valid URL', { input });
     return null;
   }
   if (!/spotify\.com$/i.test(parsed.hostname) && parsed.hostname !== 'open.spotify.com') {
-    if (!parsed.hostname.includes('spotify.com')) return null;
+    if (!parsed.hostname.includes('spotify.com')) {
+      log.debug('parseSpotifyUrl: not a spotify.com host', { input, hostname: parsed.hostname });
+      return null;
+    }
   }
   const parts = parsed.pathname.split('/').filter(Boolean);
   // /track/id, /intl-en/album/id, /playlist/id, /artist/id
   const typeIdx = parts.findIndex((p) => ['track', 'album', 'playlist', 'artist'].includes(p));
-  if (typeIdx === -1 || !parts[typeIdx + 1]) return null;
+  if (typeIdx === -1 || !parts[typeIdx + 1]) {
+    log.debug('parseSpotifyUrl: no recognizable type/id segment', { input, parts });
+    return null;
+  }
   const id = parts[typeIdx + 1].split('?')[0];
-  return { type: parts[typeIdx], id };
+  const result = { type: parts[typeIdx], id };
+  log.debug('parseSpotifyUrl', { input, result });
+  return result;
 }
 
 async function token() {
   if (!spotifyConfigured()) {
     throw new Error('Spotify client credentials are not configured. Copy .env.example to .env.');
   }
-  if (cached.token && Date.now() < cached.expiresAt - 15_000) return cached.token;
+  if (cached.token && Date.now() < cached.expiresAt - 15_000) {
+    log.debug('token: using cached token', { expiresInMs: cached.expiresAt - Date.now() });
+    return cached.token;
+  }
+  log.debug('token: cache miss/expired, requesting a new client-credentials token');
+  const end = log.time('spotify token request');
   const body = new URLSearchParams({ grant_type: 'client_credentials' });
   const basic = Buffer.from(
     `${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`,
@@ -40,12 +60,15 @@ async function token() {
   const res = await fetch(TOKEN_URL, {
     method: 'POST',
     headers: {
+      // Never log the Authorization header itself — it encodes the client secret.
       Authorization: `Basic ${basic}`,
       'Content-Type': 'application/x-www-form-urlencoded',
     },
     body,
   });
+  log.debug('token: response received', { status: res.status, ok: res.ok });
   if (!res.ok) {
+    end({ failed: true, status: res.status });
     throw new Error(`Spotify token failed: ${res.status} ${await res.text()}`);
   }
   const json = await res.json();
@@ -53,6 +76,8 @@ async function token() {
     token: json.access_token,
     expiresAt: Date.now() + json.expires_in * 1000,
   };
+  end({ expiresInSec: json.expires_in });
+  log.debug('token: new token cached', { expiresInSec: json.expires_in, token: '[redacted]' });
   return cached.token;
 }
 
@@ -63,21 +88,30 @@ async function api(pathname, params) {
       if (v != null) url.searchParams.set(k, String(v));
     }
   }
+  log.debug('api: request', { pathname, params, url: url.toString() });
+  const end = log.time(`spotify api ${pathname}`);
   const res = await fetch(url, { headers: { Authorization: `Bearer ${await token()}` } });
+  log.debug('api: response', { pathname, status: res.status, ok: res.ok });
   if (!res.ok) {
+    end({ failed: true, status: res.status });
     throw new Error(`Spotify ${pathname} failed: ${res.status} ${await res.text()}`);
   }
-  return res.json();
+  const json = await res.json();
+  end({ status: res.status });
+  return json;
 }
 
 export function pickImage(images, min = 0) {
   if (!Array.isArray(images) || !images.length) return null;
   const sorted = [...images].sort((a, b) => (b.width || 0) - (a.width || 0));
-  return sorted.find((i) => (i.width || 0) >= min) || sorted[0];
+  const chosen = sorted.find((i) => (i.width || 0) >= min) || sorted[0];
+  log.debug('pickImage', { candidateCount: images.length, min, chosen: chosen?.url });
+  return chosen;
 }
 
 export function mapTrack(track, albumOverride) {
   if (!track) return null;
+  log.debug('mapTrack', { id: track.id, name: track.name });
   const album = albumOverride || track.album || {};
   const artists = track.artists || [];
   const author = artists.map((a) => a.name).filter(Boolean).join(', ') || 'Unknown Artist';
@@ -118,41 +152,59 @@ export function mapTrack(track, albumOverride) {
 }
 
 export async function getTrack(id) {
+  log.debug('getTrack', { id });
   return api(`/tracks/${id}`);
 }
 
 export async function getAlbum(id) {
+  log.debug('getAlbum', { id });
   return api(`/albums/${id}`);
 }
 
 export async function getArtist(id) {
+  log.debug('getArtist', { id });
   return api(`/artists/${id}`);
 }
 
 export async function getArtistTopTracks(id, market = 'US') {
+  log.debug('getArtistTopTracks', { id, market });
   return api(`/artists/${id}/top-tracks`, { market });
 }
 
 export async function getPlaylist(id) {
+  log.debug('getPlaylist', { id });
   return api(`/playlists/${id}`);
 }
 
 export async function getPlaylistTracks(id) {
+  log.debug('getPlaylistTracks: start', { id });
   const items = [];
   let path = `/playlists/${id}/tracks`;
   let params = { limit: 100 };
+  let page_num = 0;
   while (path) {
+    page_num += 1;
+    log.debug('getPlaylistTracks: fetching page', { id, page_num, path, params });
     const page = await api(path.startsWith('http') ? new URL(path).pathname + new URL(path).search : path, params);
     items.push(...(page.items || []));
+    log.debug('getPlaylistTracks: page result', {
+      id,
+      page_num,
+      itemsOnPage: page.items?.length || 0,
+      totalSoFar: items.length,
+      hasNext: Boolean(page.next),
+    });
     if (!page.next) break;
     const next = new URL(page.next);
     path = next.pathname.replace('/v1', '');
     params = Object.fromEntries(next.searchParams);
   }
+  log.debug('getPlaylistTracks: done', { id, totalItems: items.length, pages: page_num });
   return items;
 }
 
 export async function searchCatalog(query, types = ['track', 'album', 'artist', 'playlist'], limit = 10) {
+  log.debug('searchCatalog', { query, types, limit });
   const json = await api('/search', {
     q: query,
     type: types.join(','),
@@ -162,13 +214,17 @@ export async function searchCatalog(query, types = ['track', 'album', 'artist', 
 }
 
 export async function resolveSpotifyRef(ref) {
+  log.debug('resolveSpotifyRef: start', { ref });
+  const end = log.time('resolveSpotifyRef', { ref });
   if (ref.type === 'track') {
     const track = await getTrack(ref.id);
+    end({ kind: 'track' });
     return { kind: 'tracks', title: track.name, items: [mapTrack(track)].filter(Boolean) };
   }
   if (ref.type === 'album') {
     const album = await getAlbum(ref.id);
     const items = (album.tracks?.items || []).map((t) => mapTrack(t, album)).filter(Boolean);
+    end({ kind: 'album', trackCount: items.length });
     return {
       kind: 'album',
       title: album.name,
@@ -191,6 +247,7 @@ export async function resolveSpotifyRef(ref) {
     const playlist = await getPlaylist(ref.id);
     const tracks = await getPlaylistTracks(ref.id);
     const items = tracks.map((row) => mapTrack(row.track)).filter(Boolean);
+    end({ kind: 'playlist', trackCount: items.length });
     return {
       kind: 'playlist',
       title: playlist.name,
@@ -223,13 +280,19 @@ export async function resolveSpotifyRef(ref) {
       items: (top.tracks || []).map((t) => mapTrack(t)).filter(Boolean),
     };
   }
+  end({ failed: true, unsupportedType: ref.type });
   throw new Error(`Unsupported Spotify type: ${ref.type}`);
 }
 
 export async function searchSpotify(query) {
-  if (!spotifyConfigured()) return { tracks: [], albums: [], artists: [], playlists: [] };
+  log.debug('searchSpotify: start', { query });
+  if (!spotifyConfigured()) {
+    log.debug('searchSpotify: not configured, returning empty result set');
+    return { tracks: [], albums: [], artists: [], playlists: [] };
+  }
+  const end = log.time('searchSpotify', { query });
   const json = await searchCatalog(query);
-  return {
+  const result = {
     tracks: (json.tracks?.items || []).map((t) => mapTrack(t)).filter(Boolean),
     albums: (json.albums?.items || []).map((a) => ({
       id: `spotify:album:${a.id}`,
@@ -265,14 +328,33 @@ export async function searchSpotify(query) {
       thumbnail: pickImage(p.images)?.url || null,
     })),
   };
+  end({
+    tracks: result.tracks.length,
+    albums: result.albums.length,
+    artists: result.artists.length,
+    playlists: result.playlists.length,
+  });
+  return result;
 }
 
 export async function enrichAlbumAndArtist(trackLike) {
   const albumId = trackLike.album?.id;
   const artistId = trackLike.artists?.[0]?.id;
+  log.debug('enrichAlbumAndArtist: start', { albumId, artistId });
   const [album, artist] = await Promise.all([
-    albumId ? getAlbum(albumId).catch(() => null) : Promise.resolve(null),
-    artistId ? getArtist(artistId).catch(() => null) : Promise.resolve(null),
+    albumId
+      ? getAlbum(albumId).catch((err) => {
+          log.warn('enrichAlbumAndArtist: album fetch failed', { albumId, message: err.message });
+          return null;
+        })
+      : Promise.resolve(null),
+    artistId
+      ? getArtist(artistId).catch((err) => {
+          log.warn('enrichAlbumAndArtist: artist fetch failed', { artistId, message: err.message });
+          return null;
+        })
+      : Promise.resolve(null),
   ]);
+  log.debug('enrichAlbumAndArtist: done', { gotAlbum: Boolean(album), gotArtist: Boolean(artist) });
   return { album, artist };
 }

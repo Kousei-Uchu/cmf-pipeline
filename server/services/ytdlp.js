@@ -43,6 +43,7 @@ export function mapDump(dump) {
     author: dump.artist || dump.creator || dump.uploader || dump.channel || 'Unknown',
     channel: dump.channel || dump.uploader || null,
     duration_ms: dump.duration != null ? Math.round(Number(dump.duration) * 1000) : null,
+    view_count: dump.view_count ?? null,
     thumbnail: dump.thumbnail || dump.thumbnails?.[0]?.url || null,
     album: dump.album || null,
     track: dump.track || dump.title,
@@ -77,12 +78,41 @@ export async function downloadMedia(url, outputTemplate, formatArgs, onProgress)
   });
 }
 
+// Speed-up args shared by audio/video downloads. By default this asks
+// yt-dlp's native downloader to pull fragments concurrently. If aria2c is
+// installed and USE_ARIA2C isn't explicitly disabled, hand the download off
+// to it instead for multi-connection-per-file throughput.
+function speedArgs() {
+  const fragments = Number(process.env.YTDLP_CONCURRENT_FRAGMENTS || 4);
+  if (process.env.USE_ARIA2C === '0') {
+    return ['--concurrent-fragments', String(fragments)];
+  }
+  const connections = Number(process.env.ARIA2C_CONNECTIONS || 8);
+  return [
+    '--downloader', 'aria2c',
+    '--downloader-args', `aria2c:-x ${connections} -s ${connections} -k 1M`,
+    '--concurrent-fragments', String(fragments),
+  ];
+}
+
 export function audioFormatArgs() {
-  return ['-f', 'ba/b', '--no-mtime'];
+  return ['-f', 'ba/b', '--no-mtime', ...speedArgs()];
 }
 
 export function videoFormatArgs() {
-  return ['-f', 'bv*+ba/b', '--merge-output-format', 'mp4', '--no-mtime'];
+  return [
+    '-f',
+    'bv*[vcodec^=av01]+ba[acodec=opus]/bv*+ba/b',
+    // mkv accepts any video/audio codec pairing, so yt-dlp's internal merge
+    // step never fails here even when the fallback selector picks a
+    // non-webm-native codec (e.g. H.264). The app's own remuxWebm() step
+    // does the final webm conversion afterward (copy when possible, else
+    // transcode).
+    '--merge-output-format',
+    'mkv',
+    '--no-mtime',
+    ...speedArgs(),
+  ];
 }
 
 export function outputPath(dir, basename) {

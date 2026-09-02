@@ -1,3 +1,7 @@
+import { child } from './logger.js';
+
+const log = child('slug');
+
 export function slugify(value, fallback = 'item') {
   const slug = String(value || '')
     .normalize('NFKD')
@@ -7,9 +11,13 @@ export function slugify(value, fallback = 'item') {
     .replace(/_+/g, '_')
     .replace(/^[_.]+|[_.]+$/g, '')
     .slice(0, 80);
-  return slug || fallback;
+  const result = slug || fallback;
+  log.debug('slugify', { input: value, fallback, result });
+  return result;
 }
 
 export function folderName(title, author) {
-  return `${slugify(title, 'untitled')}_${slugify(author, 'unknown')}`;
+  const name = `${slugify(title, 'untitled')}_${slugify(author, 'unknown')}`;
+  log.debug('folderName', { title, author, name });
+  return name;
 }

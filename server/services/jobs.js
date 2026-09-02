@@ -8,16 +8,43 @@ import { searchYouTube } from './innertube.js';
 import { ytSearch, downloadMedia, audioFormatArgs, videoFormatArgs, outputPath } from './ytdlp.js';
 import {
   toMp3,
-  remuxMp4,
+  remuxWebm,
   extractPcmEnvelope,
   envelopeCorrelation,
   findNewestMedia,
+  probeHasVideoStream,
 } from './ffmpeg.js';
 import { rankCandidates, scoreCandidate } from './matcher.js';
 import { enrichAlbumAndArtist, pickImage, spotifyConfigured } from './spotify.js';
 import { downloadBinary, extFromUrl, packCmf, writeJson } from './cmf.js';
 
 const jobs = new Map();
+
+// Runs `worker` over `items` with at most `limit` in flight at once.
+// Each worker receives (item, index) — index matches the item's position
+// in the original array, even though completion order may differ.
+async function runPool(items, limit, worker) {
+  let cursor = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+}
+
+// Picks a unique folder name for an item and reserves it in `usedFolders`.
+// Called synchronously (no awaits) so concurrent pool workers can't race on
+// the same name.
+function resolveFolder(raw, usedFolders, index) {
+  const title = stripTitleNoise(raw.title || 'Untitled');
+  const author = cleanArtistName(raw.author, raw.channel, raw.raw_title || raw.title);
+  let folder = folderName(title, author);
+  if (usedFolders.has(folder)) folder = `${folder}_${index}`;
+  usedFolders.add(folder);
+  return folder;
+}
 
 export function getJob(id) {
   return jobs.get(id);
@@ -87,9 +114,11 @@ async function runJob(job) {
 
   const usedFolders = new Set();
   const mode = job.mode;
-  let index = 0;
-  for (const raw of job.items) {
-    index += 1;
+  const concurrency = Math.max(1, Number(process.env.JOB_CONCURRENCY || 3));
+
+  const failed = [];
+  await runPool(job.items, concurrency, async (raw, i) => {
+    const index = i + 1;
     emit(job, {
       type: 'item',
       index,
@@ -97,8 +126,23 @@ async function runJob(job) {
       title: raw.title,
       message: `Resolving ${raw.title}`,
     });
-    await processItem(job, raw, staged, usedFolders, mode, index);
-  }
+    const folder = resolveFolder(raw, usedFolders, index);
+    const itemDir = path.join(staged, folder);
+    try {
+      await processItem(job, raw, staged, folder, mode, index);
+    } catch (err) {
+      failed.push({ title: raw.title, error: err.message || String(err) });
+      emit(job, {
+        type: 'item_failed',
+        index,
+        title: raw.title,
+        message: `Skipping ${raw.title}: ${err.message}`,
+      });
+      // Don't ship a half-written folder for a track that failed partway
+      // (e.g. audio succeeded but every video candidate errored out).
+      await fs.rm(itemDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
 
   emit(job, { type: 'status', message: 'Packing .cmf archive' });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -117,6 +161,7 @@ async function runJob(job) {
     exportUrl: job.exportUrlPath,
     skipped: packed.skipped,
     bytes: packed.bytes,
+    failedItems: failed,
   });
   emit(job, { type: 'close' });
   for (const res of job.listeners) res.end();
@@ -125,12 +170,9 @@ async function runJob(job) {
   fs.rm(work, { recursive: true, force: true }).catch(() => {});
 }
 
-async function processItem(job, raw, staged, usedFolders, mode, index) {
+async function processItem(job, raw, staged, folder, mode, index) {
   const title = stripTitleNoise(raw.title || 'Untitled');
   const author = cleanArtistName(raw.author, raw.channel, raw.raw_title || raw.title);
-  let folder = folderName(title, author);
-  if (usedFolders.has(folder)) folder = `${folder}_${index}`;
-  usedFolders.add(folder);
 
   const itemDir = path.join(staged, folder);
   const audioDir = path.join(itemDir, 'audio');
@@ -200,28 +242,30 @@ async function processItem(job, raw, staged, usedFolders, mode, index) {
       });
       const audioEnv = await extractPcmEnvelope(audioFile, 30).catch(() => null);
       if (audioEnv) {
-        for (const row of top) {
-          try {
-            const probeDir = path.join(tmpItem, `probe_${row.candidate.youtube_id || row.candidate.id}`);
-            await fs.mkdir(probeDir, { recursive: true });
-            const url = row.candidate.url;
-            await downloadMedia(url, outputPath(probeDir, 'clip'), [
-              '-f',
-              'ba/b',
-              '--no-mtime',
-              '--download-sections',
-              '*0:00-0:35',
-            ]);
-            const clip = await findNewestMedia(probeDir, 'clip');
-            if (!clip) continue;
-            const env = await extractPcmEnvelope(clip, 30);
-            const wave = envelopeCorrelation(audioEnv, env);
-            row.candidate.waveform = wave;
-            row.score = scoreCandidate({ ...target, intent: 'video' }, row.candidate, wave);
-          } catch (err) {
-            emit(job, { type: 'log', message: `Waveform probe skipped: ${err.message}` });
-          }
-        }
+        await Promise.all(
+          top.map(async (row) => {
+            try {
+              const probeDir = path.join(tmpItem, `probe_${row.candidate.youtube_id || row.candidate.id}`);
+              await fs.mkdir(probeDir, { recursive: true });
+              const url = row.candidate.url;
+              await downloadMedia(url, outputPath(probeDir, 'clip'), [
+                '-f',
+                'ba/b',
+                '--no-mtime',
+                '--download-sections',
+                '*0:00-0:35',
+              ]);
+              const clip = await findNewestMedia(probeDir, 'clip');
+              if (!clip) return;
+              const env = await extractPcmEnvelope(clip, 30);
+              const wave = envelopeCorrelation(audioEnv, env);
+              row.candidate.waveform = wave;
+              row.score = scoreCandidate({ ...target, intent: 'video' }, row.candidate, wave);
+            } catch (err) {
+              emit(job, { type: 'log', message: `Waveform probe skipped: ${err.message}` });
+            }
+          }),
+        );
         ranked = [...ranked].sort((a, b) => b.score.total - a.score.total);
         videoPick.candidate = ranked[0].candidate;
         videoPick.url = ranked[0].candidate.url;
@@ -233,16 +277,73 @@ async function processItem(job, raw, staged, usedFolders, mode, index) {
       }
     }
     matchNotes.video = videoPick.note;
-    emit(job, { type: 'phase', item: index, phase: 'video', message: `Downloading video: ${videoPick.url}` });
-    await downloadMedia(videoPick.url, outputPath(tmpItem, 'video'), videoFormatArgs(), (chunk) => {
-      const line = String(chunk).trim().split('\n').pop();
-      if (line) emit(job, { type: 'ytdlp', item: index, line });
-    });
-    const src = await findNewestMedia(tmpItem, 'video');
-    if (!src) throw new Error(`No video file downloaded for ${title}`);
-    const dest = path.join(videoDir, `${folder}.mp4`);
-    await remuxMp4(src, dest);
-    videoRel = `/${folder}/video/${folder}.mp4`;
+
+    // Try candidates in ranked order (best first) until one actually
+    // downloads a file with a real video stream — some "official music
+    // video" search hits are audio-only uploads, which used to get
+    // shipped as a video-extension file with no video frames.
+    const candidateQueue = ranked.length
+      ? ranked.map((r) => r.candidate)
+      : [videoPick.candidate];
+    const rejected = [];
+    let src = null;
+    let winningCandidate = null;
+    for (let attempt = 0; attempt < candidateQueue.length; attempt++) {
+      const candidate = candidateQueue[attempt];
+      const attemptDir = path.join(tmpItem, `video_try_${attempt}`);
+      await fs.mkdir(attemptDir, { recursive: true });
+      emit(job, {
+        type: 'phase',
+        item: index,
+        phase: 'video',
+        message: `Downloading video: ${candidate.url}`,
+      });
+      try {
+        await downloadMedia(candidate.url, outputPath(attemptDir, 'video'), videoFormatArgs(), (chunk) => {
+          const line = String(chunk).trim().split('\n').pop();
+          if (line) emit(job, { type: 'ytdlp', item: index, line });
+        });
+      } catch (err) {
+        rejected.push({ url: candidate.url, reason: `download_error: ${String(err.message || err).slice(0, 200)}` });
+        emit(job, { type: 'log', message: `Video download failed for ${candidate.url}: ${err.message}` });
+        continue;
+      }
+      const downloaded = await findNewestMedia(attemptDir, 'video');
+      if (!downloaded) {
+        rejected.push({ url: candidate.url, reason: 'download_failed' });
+        continue;
+      }
+      const hasVideo = await probeHasVideoStream(downloaded);
+      if (!hasVideo) {
+        rejected.push({ url: candidate.url, reason: 'no_video_stream' });
+        emit(job, {
+          type: 'log',
+          message: `Rejected audio-only candidate for video: ${candidate.url}`,
+        });
+        continue;
+      }
+      src = downloaded;
+      winningCandidate = candidate;
+      break;
+    }
+
+    if (!src) {
+      throw new Error(
+        `No candidate with an actual video stream found for ${title} (${rejected.length} rejected)`,
+      );
+    }
+
+    if (winningCandidate && winningCandidate !== videoPick.candidate) {
+      videoPick.url = winningCandidate.url;
+      matchNotes.video = { ...matchNotes.video, fallback_candidate: winningCandidate.url };
+    }
+    if (rejected.length) {
+      matchNotes.video = { ...matchNotes.video, rejected_audio_only: rejected };
+    }
+
+    const dest = path.join(videoDir, `${folder}.webm`);
+    await remuxWebm(src, dest);
+    videoRel = `/${folder}/video/${folder}.webm`;
   }
 
   const assetRels = [];
@@ -322,8 +423,8 @@ async function pickSource(raw, target, kind) {
 
   const query =
     kind === 'video'
-      ? `${target.author} ${target.title} official music video`
-      : `${target.author} ${target.title} official audio`;
+      ? `${target.author} ${target.title}`
+      : `${target.author} ${target.title}`;
 
   let candidates = [];
   try {

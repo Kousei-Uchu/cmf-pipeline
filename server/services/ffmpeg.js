@@ -64,6 +64,67 @@ export async function remuxMp4(inputPath, outputPath) {
   }
 }
 
+export async function toWebm(inputPath, outputPath) {
+  await run(
+    bin(),
+    [
+      '-y',
+      '-i', inputPath,
+      '-c:v', 'libsvtav1',   // Switched from VP9 to AV1
+      '-crf', '35',          // AV1 scales differently; 35 is highly compressed but clean
+      '-preset', '4',        // 4 gives an excellent quality-to-size compression ratio
+      '-pix_fmt', 'yuv420p10le', // 10-bit color reduces file size and prevents color banding
+      '-c:a', 'libopus',
+      '-b:a', '128k',        // 128k Opus is virtually transparent for stereo music
+      outputPath,
+    ],
+    { timeoutMs: 30 * 60_000 },
+  );
+  return outputPath;
+}
+
+
+export async function remuxWebm(inputPath, outputPath) {
+  try {
+    await run(bin(), ['-y', '-i', inputPath, '-c', 'copy', outputPath], {
+      timeoutMs: 10 * 60_000,
+    });
+    return outputPath;
+  } catch {
+    return toWebm(inputPath, outputPath);
+  }
+}
+
+/**
+ * True if the file has at least one video stream (as opposed to an
+ * audio-only file that merely got wrapped in a video container).
+ */
+export async function probeHasVideoStream(inputPath) {
+  try {
+    const { stdout } = await run(
+      process.env.FFPROBE_PATH || 'ffprobe',
+      [
+        '-v',
+        'error',
+        '-select_streams',
+        'v',
+        '-show_entries',
+        'stream=codec_type',
+        '-of',
+        'csv=p=0',
+        inputPath,
+      ],
+      { timeoutMs: 30_000 },
+    );
+    return stdout
+      .trim()
+      .split('\n')
+      .some((line) => line.trim() === 'video');
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Mono f32le PCM for the first `seconds` of a file, 8 kHz.
  */

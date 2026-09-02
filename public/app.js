@@ -10,6 +10,7 @@ const state = {
 
 const healthEl = $('#health');
 const groupsEl = $('#groups');
+const inspector = $('#inspector');
 const inspectEmpty = $('#empty-inspect');
 const inspectBody = $('#inspect-body');
 const dock = $('#dock');
@@ -62,6 +63,44 @@ function cardButton(item, groupId) {
   return btn;
 }
 
+function collectionThumb(result) {
+  const img = result.collection?.images?.[0]?.url;
+  if (img) return img;
+  return thumb(result.items?.[0] || {});
+}
+
+function renderDownloadAllBar(result) {
+  const count = result.items?.length || 0;
+  if (result.kind !== 'url' || count < 2) return;
+  const bar = document.createElement('div');
+  bar.className = 'download-all-bar';
+  bar.innerHTML = `
+    <img alt="" src="${escapeAttr(collectionThumb(result))}" />
+    <div class="meta">
+      <p class="eyebrow">${escapeHtml(result.collection_kind || result.source || 'collection')}</p>
+      <h2>${escapeHtml(result.title || 'Collection')}</h2>
+      <p class="muted">${count} tracks</p>
+    </div>
+    <button type="button" id="download-all-btn">Download all</button>
+  `;
+  bar.querySelector('#download-all-btn').addEventListener('click', () => openCollectionInspector(result));
+  groupsEl.append(bar);
+}
+
+function openCollectionInspector(result) {
+  document.querySelectorAll('.card.selected').forEach((el) => el.classList.remove('selected'));
+  state.selected = null;
+  const items = result.items || [];
+  state.expanded = { title: result.title, items };
+  renderInspectorCollection({
+    type: result.collection_kind || result.kind || 'collection',
+    title: result.title || 'Collection',
+    thumbSrc: collectionThumb(result),
+    items,
+  });
+  inspector.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
 function renderGroups(result) {
   groupsEl.innerHTML = '';
   if (result.error) {
@@ -72,6 +111,7 @@ function renderGroups(result) {
     groupsEl.innerHTML = `<p class="muted">Nothing matched.</p>`;
     return;
   }
+  renderDownloadAllBar(result);
   for (const group of result.groups) {
     const wrap = document.createElement('section');
     wrap.className = 'group';
@@ -109,23 +149,28 @@ async function selectItem(item, groupId, btn) {
       return;
     }
     state.expanded = data;
-    renderInspectorCollection(item, data);
+    renderInspectorCollection({
+      type: item.type,
+      title: data.title || item.title,
+      thumbSrc: thumb(item),
+      items: data.items || [],
+    });
     return;
   }
 
   renderInspectorTrack(item);
 }
 
-function renderInspectorCollection(item, data) {
+function renderInspectorCollection({ type, title, thumbSrc, items }) {
   inspectEmpty.classList.add('hidden');
   inspectBody.classList.remove('hidden');
   inspectBody.innerHTML = `
     <div class="cover-row">
-      <img alt="" src="${escapeAttr(thumb(item))}" />
+      <img alt="" src="${escapeAttr(thumbSrc)}" />
       <div>
-        <p class="eyebrow">${escapeHtml(item.type)}</p>
-        <h2>${escapeHtml(data.title || item.title)}</h2>
-        <p class="muted">${data.items?.length || 0} items</p>
+        <p class="eyebrow">${escapeHtml(type || '')}</p>
+        <h2>${escapeHtml(title || '')}</h2>
+        <p class="muted">${items?.length || 0} items</p>
       </div>
     </div>
     ${modePicker()}
@@ -136,9 +181,9 @@ function renderInspectorCollection(item, data) {
     <div class="cards" id="expand-cards"></div>
   `;
   wireModes();
-  $('#run-all')?.addEventListener('click', () => startJob(data.items || []));
+  $('#run-all')?.addEventListener('click', () => startJob(items || []));
   const grid = $('#expand-cards');
-  for (const track of data.items || []) {
+  for (const track of items || []) {
     grid.append(cardButton(track, 'expanded'));
   }
 }
