@@ -8,7 +8,7 @@ const WEIGHTS = {
   artist: 0.18,
   duration: 0.09,
   keywords: 0.20,
-  channel: 0.15,
+  channel: 0.20,
   views: 0.22,
   waveform: 0.15,
 };
@@ -37,7 +37,17 @@ const VIDEO_PENALTY = [
   /provided to youtube/i,
   /topic/i,
   /visualizer/i,
+  /fan\s*(made|video|edit|art)/i,
+  /unofficial/i,
+  /tribute/i,
+  /type\s*beat/i,
+  /instrumental/i,
+  /\bremix\b/i,
+  /\bmashup\b/i,
+  /\bedit\b/i,
+  /\btiktok\b/i,
 ];
+
 
 const AUDIO_BONUS = [/official\s*audio/i, /provided to youtube/i, /topic/i, /visualizer/i];
 

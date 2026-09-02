@@ -20,6 +20,8 @@ Spotify’s API does not give you audio files. SpotDL is already “metadata fro
 
 Optional: a Spotify app at [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard) with **Client ID** and **Client Secret**.
 
+Optional: a free [Genius API client](https://genius.com/api-clients) (New API Client → Generate Access Token) for `GENIUS_ACCESS_TOKEN`. See "Music video matching" below.
+
 ## Setup
 
 ```bash
@@ -66,7 +68,19 @@ Identical file contents (same SHA-256) are stored once in the zip; later copies 
 
 ## Matching
 
-Candidates are scored on title similarity, artist/channel, duration, official-video vs lyric/live penalties, and (when both audio and video are requested) RMS-envelope correlation of the first ~30 seconds. YouTube Music “Artist - Topic” / “Official Audio” names are cleaned before packing.
+Audio is always sourced from YouTube via the weighted search below — Genius is never consulted for audio.
+
+For video, candidates are scored on title similarity, artist/channel, duration, official-video vs lyric/live penalties, and (when both audio and video are requested) RMS-envelope correlation of the first ~30 seconds. YouTube Music “Artist - Topic” / “Official Audio” names are cleaned before packing.
+
+### Music video matching (Genius)
+
+If `GENIUS_ACCESS_TOKEN` is set, video selection asks [Genius](https://genius.com) first instead of relying purely on weighted YouTube search: a Genius song page's linked YouTube media (filtered to non-`- Topic` channels) is a stronger "does an MV exist, and which upload is it" signal than free-text search scoring.
+
+- **Genius points at a specific video** — that upload is used directly (skipping the match-score threshold), then downloaded through the normal pipeline below.
+- **Genius confirms no MV exists** (every linked upload is a `- Topic` audio track) — video is skipped entirely for that song; it ships audio-only.
+- **Genius has no usable answer** (not configured, no song match, no YouTube media, or an MV may exist but none of its linked uploads survived the `- Topic` filter) — falls back to the weighted YouTube search unchanged.
+
+Either way, once a video candidate is chosen it goes through the same download → video-stream check → audio-only fallback safety net as before.
 
 ## Logging
 

@@ -4,11 +4,12 @@ import path from 'node:path';
 import { folderName } from '../lib/slug.js';
 import { cleanArtistName, stripTitleNoise } from '../lib/text.js';
 import { EXPORTS_DIR, TMP_DIR } from '../lib/paths.js';
-import { searchYouTube } from './innertube.js';
+import { searchYouTube, innertube, getVideoDetails } from './innertube.js';
+import { findOfficialVideoViaGenius, geniusConfigured } from '../lib/genius.js';
 import { ytSearch, downloadMedia, audioFormatArgs, videoFormatArgs, outputPath } from './ytdlp.js';
 import {
   toMp3,
-  remuxWebm,
+  remuxMp4,
   extractPcmEnvelope,
   envelopeCorrelation,
   findNewestMedia,
@@ -19,6 +20,19 @@ import { enrichAlbumAndArtist, pickImage, spotifyConfigured } from './spotify.js
 import { downloadBinary, extFromUrl, packCmf, writeJson } from './cmf.js';
 
 const jobs = new Map();
+
+// Below this total score, or below this specific keyword-signal score, a
+// video candidate is treated as "probably not actually the thing we
+// wanted" (fan edit, cover, reaction, lyric video, etc.) rather than
+// forced through as the best available option. `keywords` in particular is
+// the strongest available signal for this today — see matcher.js's
+// VIDEO_BONUS/VIDEO_PENALTY lists — since a fan-made or unofficial upload
+// usually trips one of those penalty patterns even when its title/artist
+// text otherwise matches well. Tune via env if your library's real score
+// distribution (visible in each item's matchNotes.video.considered) calls
+// for it.
+const MIN_VIDEO_MATCH_SCORE = Number(process.env.MIN_VIDEO_MATCH_SCORE ?? 0.55);
+const MIN_VIDEO_KEYWORD_SCORE = Number(process.env.MIN_VIDEO_KEYWORD_SCORE ?? 0.35);
 
 // Runs `worker` over `items` with at most `limit` in flight at once.
 // Each worker receives (item, index) — index matches the item's position
@@ -228,122 +242,195 @@ async function processItem(job, raw, staged, folder, mode, index) {
     audioRel = `/${folder}/audio/${folder}.mp3`;
   }
 
+  // Shared by both video-skipped-entirely and video-download-failed paths
+  // below: makes sure this item still ships with audio even though it was
+  // requested with video.
+  async function ensureAudioFallback(reasonMessage) {
+    if (audioFile) return;
+    await fs.mkdir(audioDir, { recursive: true });
+    emit(job, { type: 'phase', item: index, phase: 'audio', message: reasonMessage });
+    const audioPick = await pickSource(raw, { ...target, intent: 'audio' }, 'audio');
+    matchNotes.audio = audioPick.note;
+    await downloadMedia(audioPick.url, outputPath(tmpItem, 'audio_fallback'), audioFormatArgs(), (chunk) => {
+      const line = String(chunk).trim().split('\n').pop();
+      if (line) emit(job, { type: 'ytdlp', item: index, line });
+    });
+    const fallbackSrc = await findNewestMedia(tmpItem, 'audio_fallback');
+    if (!fallbackSrc) {
+      throw new Error(`No audio fallback source downloaded for ${title} after video match failed`);
+    }
+    const fallbackDest = path.join(audioDir, `${folder}.mp3`);
+    await toMp3(fallbackSrc, fallbackDest);
+    audioFile = fallbackDest;
+    audioRel = `/${folder}/audio/${folder}.mp3`;
+  }
+
   if (wantVideo) {
     emit(job, { type: 'phase', item: index, phase: 'video', message: 'Matching music video' });
-    const videoPick = await pickSource(raw, { ...target, intent: 'video' }, 'video');
-    let ranked = videoPick.ranked || [];
-    if (audioFile && ranked.length) {
-      const top = ranked.slice(0, 3);
-      emit(job, {
-        type: 'phase',
-        item: index,
-        phase: 'waveform',
-        message: `Waveform-matching top ${top.length} video candidates`,
-      });
-      const audioEnv = await extractPcmEnvelope(audioFile, 30).catch(() => null);
-      if (audioEnv) {
-        await Promise.all(
-          top.map(async (row) => {
-            try {
-              const probeDir = path.join(tmpItem, `probe_${row.candidate.youtube_id || row.candidate.id}`);
-              await fs.mkdir(probeDir, { recursive: true });
-              const url = row.candidate.url;
-              await downloadMedia(url, outputPath(probeDir, 'clip'), [
-                '-f',
-                'ba/b',
-                '--no-mtime',
-                '--download-sections',
-                '*0:00-0:35',
-              ]);
-              const clip = await findNewestMedia(probeDir, 'clip');
-              if (!clip) return;
-              const env = await extractPcmEnvelope(clip, 30);
-              const wave = envelopeCorrelation(audioEnv, env);
-              row.candidate.waveform = wave;
-              row.score = scoreCandidate({ ...target, intent: 'video' }, row.candidate, wave);
-            } catch (err) {
-              emit(job, { type: 'log', message: `Waveform probe skipped: ${err.message}` });
-            }
-          }),
-        );
-        ranked = [...ranked].sort((a, b) => b.score.total - a.score.total);
-        videoPick.candidate = ranked[0].candidate;
-        videoPick.url = ranked[0].candidate.url;
-        videoPick.note = {
-          ...videoPick.note,
-          waveform_applied: true,
-          winner: ranked[0].score,
-        };
-      }
-    }
-    matchNotes.video = videoPick.note;
+    const videoPick = await pickVideoSource(raw, { ...target, intent: 'video' });
 
-    // Try candidates in ranked order (best first) until one actually
-    // downloads a file with a real video stream — some "official music
-    // video" search hits are audio-only uploads, which used to get
-    // shipped as a video-extension file with no video frames.
-    const candidateQueue = ranked.length
-      ? ranked.map((r) => r.candidate)
-      : [videoPick.candidate];
-    const rejected = [];
-    let src = null;
-    let winningCandidate = null;
-    for (let attempt = 0; attempt < candidateQueue.length; attempt++) {
-      const candidate = candidateQueue[attempt];
-      const attemptDir = path.join(tmpItem, `video_try_${attempt}`);
-      await fs.mkdir(attemptDir, { recursive: true });
+    if (videoPick.skip) {
+      // Genius confirmed no official MV exists for this song — don't run it
+      // through the search/download pipeline at all, just ship audio.
       emit(job, {
-        type: 'phase',
-        item: index,
-        phase: 'video',
-        message: `Downloading video: ${candidate.url}`,
+        type: 'log',
+        message: `No official music video exists for ${title} (per Genius) — shipping audio only.`,
       });
-      try {
-        await downloadMedia(candidate.url, outputPath(attemptDir, 'video'), videoFormatArgs(), (chunk) => {
-          const line = String(chunk).trim().split('\n').pop();
-          if (line) emit(job, { type: 'ytdlp', item: index, line });
+      matchNotes.video = videoPick.note;
+      await ensureAudioFallback('No music video exists for this song — falling back to audio source');
+      // videoRel stays null — this item ships as audio-only. Fall through to
+      // the shared cover-art/info.json code below (skip the rest of the
+      // video search/download logic).
+    } else {
+      let ranked = videoPick.ranked || [];
+      if (audioFile && ranked.length) {
+        const top = ranked.slice(0, 3);
+        emit(job, {
+          type: 'phase',
+          item: index,
+          phase: 'waveform',
+          message: `Waveform-matching top ${top.length} video candidates`,
         });
-      } catch (err) {
-        rejected.push({ url: candidate.url, reason: `download_error: ${String(err.message || err).slice(0, 200)}` });
-        emit(job, { type: 'log', message: `Video download failed for ${candidate.url}: ${err.message}` });
-        continue;
+        const audioEnv = await extractPcmEnvelope(audioFile, 30).catch(() => null);
+        if (audioEnv) {
+          await Promise.all(
+            top.map(async (row) => {
+              try {
+                const probeDir = path.join(tmpItem, `probe_${row.candidate.youtube_id || row.candidate.id}`);
+                await fs.mkdir(probeDir, { recursive: true });
+                const url = row.candidate.url;
+                await downloadMedia(url, outputPath(probeDir, 'clip'), [
+                  '-f',
+                  'ba/b',
+                  '--no-mtime',
+                  '--download-sections',
+                  '*0:00-0:35',
+                ]);
+                const clip = await findNewestMedia(probeDir, 'clip');
+                if (!clip) return;
+                const env = await extractPcmEnvelope(clip, 30);
+                const wave = envelopeCorrelation(audioEnv, env);
+                row.candidate.waveform = wave;
+                row.score = scoreCandidate({ ...target, intent: 'video' }, row.candidate, wave);
+              } catch (err) {
+                emit(job, { type: 'log', message: `Waveform probe skipped: ${err.message}` });
+              }
+            }),
+          );
+          ranked = [...ranked].sort((a, b) => b.score.total - a.score.total);
+          videoPick.candidate = ranked[0].candidate;
+          videoPick.url = ranked[0].candidate.url;
+          videoPick.note = {
+            ...videoPick.note,
+            waveform_applied: true,
+            winner: ranked[0].score,
+          };
+        }
       }
-      const downloaded = await findNewestMedia(attemptDir, 'video');
-      if (!downloaded) {
-        rejected.push({ url: candidate.url, reason: 'download_failed' });
-        continue;
+      matchNotes.video = videoPick.note;
+
+      // Only trust candidates that look like they're actually the thing we
+      // asked for. `keywords` specifically catches fan edits / covers /
+      // reactions / lyric videos that VIDEO_PENALTY recognizes even when
+      // title+artist text otherwise scores well.
+      const qualifies = (r) =>
+        r.score.total >= MIN_VIDEO_MATCH_SCORE && r.score.parts.keywords >= MIN_VIDEO_KEYWORD_SCORE;
+      const qualifyingRanked = ranked.filter(qualifies);
+      const bestScore = ranked[0]?.score.total ?? null;
+
+      // Try candidates in ranked order (best first) until one actually
+      // downloads a file with a real video stream — some "official music
+      // video" search hits are audio-only uploads, which used to get
+      // shipped as a video-extension file with no video frames.
+      const candidateQueue = videoPick.forced
+        ? [videoPick.candidate] // Genius already identified this as the MV — trust it, skip the score threshold
+        : qualifyingRanked.length
+          ? qualifyingRanked.map((r) => r.candidate)
+          : ranked.length
+            ? [] // nothing qualified — go straight to the audio fallback below
+            : [videoPick.candidate]; // no ranked list at all (e.g. fallback_url strategy) — try the one pick we have
+      const rejected = [];
+      let src = null;
+      let winningCandidate = null;
+      for (let attempt = 0; attempt < candidateQueue.length; attempt++) {
+        const candidate = candidateQueue[attempt];
+        const attemptDir = path.join(tmpItem, `video_try_${attempt}`);
+        await fs.mkdir(attemptDir, { recursive: true });
+        emit(job, {
+          type: 'phase',
+          item: index,
+          phase: 'video',
+          message: `Downloading video: ${candidate.url}`,
+        });
+        try {
+          await downloadMedia(candidate.url, outputPath(attemptDir, 'video'), videoFormatArgs(), (chunk) => {
+            const line = String(chunk).trim().split('\n').pop();
+            if (line) emit(job, { type: 'ytdlp', item: index, line });
+          });
+        } catch (err) {
+          rejected.push({ url: candidate.url, reason: `download_error: ${String(err.message || err).slice(0, 200)}` });
+          emit(job, { type: 'log', message: `Video download failed for ${candidate.url}: ${err.message}` });
+          continue;
+        }
+        const downloaded = await findNewestMedia(attemptDir, 'video');
+        if (!downloaded) {
+          rejected.push({ url: candidate.url, reason: 'download_failed' });
+          continue;
+        }
+        const hasVideo = await probeHasVideoStream(downloaded);
+        if (!hasVideo) {
+          rejected.push({ url: candidate.url, reason: 'no_video_stream' });
+          emit(job, {
+            type: 'log',
+            message: `Rejected audio-only candidate for video: ${candidate.url}`,
+          });
+          continue;
+        }
+        src = downloaded;
+        winningCandidate = candidate;
+        break;
       }
-      const hasVideo = await probeHasVideoStream(downloaded);
-      if (!hasVideo) {
-        rejected.push({ url: candidate.url, reason: 'no_video_stream' });
+
+      if (!src) {
+        // No confident candidate at all, every confident candidate failed to
+        // actually download/produce a video stream, or (forced case) the
+        // single Genius-identified video itself failed to download — rather
+        // than aborting the item (or, worse, shipping a low-confidence fan
+        // video/cover as "the video"), fall back to the plain audio/song
+        // source. If audio mode wasn't requested for this item, fetch it now.
+        const reason = videoPick.forced
+          ? 'genius_video_download_failed'
+          : qualifyingRanked.length
+            ? 'download_failed_all_candidates'
+            : 'no_confident_video_match';
         emit(job, {
           type: 'log',
-          message: `Rejected audio-only candidate for video: ${candidate.url}`,
+          message: `No usable video for ${title} (${reason}, best score ${bestScore != null ? bestScore.toFixed(2) : 'n/a'}) — falling back to audio source.`,
         });
-        continue;
+        matchNotes.video = {
+          ...matchNotes.video,
+          fallback_to_audio: true,
+          fallback_reason: reason,
+          best_rejected_score: bestScore,
+          rejected: rejected.length ? rejected : undefined,
+        };
+
+        await ensureAudioFallback('No confident video match — falling back to audio source');
+        // videoRel stays null — this item ships as audio-only.
+      } else {
+        if (winningCandidate && winningCandidate !== videoPick.candidate) {
+          videoPick.url = winningCandidate.url;
+          matchNotes.video = { ...matchNotes.video, fallback_candidate: winningCandidate.url };
+        }
+        if (rejected.length) {
+          matchNotes.video = { ...matchNotes.video, rejected_audio_only: rejected };
+        }
+
+        const dest = path.join(videoDir, `${folder}.mp4`);
+        await remuxMp4(src, dest);
+        videoRel = `/${folder}/video/${folder}.mp4`;
       }
-      src = downloaded;
-      winningCandidate = candidate;
-      break;
-    }
-
-    if (!src) {
-      throw new Error(
-        `No candidate with an actual video stream found for ${title} (${rejected.length} rejected)`,
-      );
-    }
-
-    if (winningCandidate && winningCandidate !== videoPick.candidate) {
-      videoPick.url = winningCandidate.url;
-      matchNotes.video = { ...matchNotes.video, fallback_candidate: winningCandidate.url };
-    }
-    if (rejected.length) {
-      matchNotes.video = { ...matchNotes.video, rejected_audio_only: rejected };
-    }
-
-    const dest = path.join(videoDir, `${folder}.webm`);
-    await remuxWebm(src, dest);
-    videoRel = `/${folder}/video/${folder}.webm`;
+    } // end videoPick.skip / weighted-search else branch
   }
 
   const assetRels = [];
@@ -497,6 +584,74 @@ async function pickSource(raw, target, kind) {
       })),
     },
   };
+}
+
+// Video-only entry point. Prefers Genius (see server/lib/genius.js) over
+// the weighted YouTube search below — a Genius song page's YouTube media
+// links, filtered to non-"- Topic" channels, are a stronger "does an MV
+// exist, and which upload is it" signal than free-text search scoring.
+//
+// Three outcomes:
+//  - Genius can't help (not configured, no song match, no YouTube media,
+//    or a request failed) -> unchanged weighted-search fallback below.
+//  - Genius confirms no MV exists (every linked upload is "- Topic") ->
+//    `{ skip: true }`; the caller skips video entirely for this item.
+//  - Genius points at a specific non-Topic video -> `{ forced: true, ... }`;
+//    the caller downloads that candidate directly, bypassing the match-score
+//    threshold, but still through the normal download/probe/reject pipeline.
+async function pickVideoSource(raw, target) {
+  const query = `${target.author} ${target.title}`;
+
+  if (!geniusConfigured()) {
+    return pickSource(raw, target, 'video');
+  }
+
+  let genius = null;
+  try {
+    genius = await findOfficialVideoViaGenius(query, { innertube });
+  } catch {
+    genius = null; // any Genius/Innertube error is treated as "couldn't help"
+  }
+
+  if (genius?.noMV) {
+    return {
+      skip: true,
+      note: { strategy: 'genius', query, genius: genius.genius, result: 'no_mv_confirmed' },
+    };
+  }
+
+  const top = genius?.results?.top;
+  if (top?.videoId) {
+    const url = `https://www.youtube.com/watch?v=${top.videoId}`;
+    const details = await getVideoDetails(top.videoId).catch(() => null);
+    const candidate = details || {
+      title: top.title,
+      author: target.author,
+      channel: top.channel,
+      raw_title: top.title,
+      duration_ms: null,
+      url,
+      youtube_id: top.videoId,
+    };
+    return {
+      url: candidate.url,
+      candidate,
+      forced: true,
+      ranked: [],
+      note: { strategy: 'genius', query, genius: genius.genius, videoId: top.videoId, channel: top.channel },
+    };
+  }
+
+  // genius === null, or genius.noMV === false with no surviving top
+  // candidate (an MV may exist but Genius only linked "- Topic" uploads
+  // for it) — fall back to the existing weighted YouTube search unchanged.
+  const fallback = await pickSource(raw, target, 'video');
+  fallback.note = {
+    ...fallback.note,
+    genius_checked: true,
+    genius_fallback_reason: genius ? 'no_qualifying_genius_candidate' : 'no_genius_match',
+  };
+  return fallback;
 }
 
 export function pruneExports() {

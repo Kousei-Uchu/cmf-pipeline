@@ -101,8 +101,18 @@ function collectMedia(node, acc = []) {
     for (const child of node) collectMedia(child, acc);
     return acc;
   }
-  const type = node.type || node.item_type;
-  if (type === 'Video' || type === 'Film' || type === 'song' || type === 'video' || node.video_id) {
+  // youtubei.js@18 returns MusicResponsiveListItem nodes for both videos
+  // and songs; `node.type` on those is always 'MusicResponsiveListItem'
+  // (the node's own class name), so it must never shadow `item_type`
+  // ('video' / 'song') the way `node.type || node.item_type` used to —
+  // that pattern silently matched nothing on every current search result.
+  const isMedia =
+    node.type === 'Video' ||
+    node.type === 'Film' ||
+    node.item_type === 'video' ||
+    node.item_type === 'song' ||
+    Boolean(node.video_id);
+  if (isMedia) {
     acc.push(node);
   }
   if (node.contents) collectMedia(node.contents, acc);
@@ -119,8 +129,15 @@ export async function searchYouTube(query, { type = 'all' } = {}) {
 
   try {
     const searchEnd = log.time('yt.music.search (video)', { query });
+
     const res = await yt.music.search(query, type === 'video' ? { type: 'video' } : undefined);
-    const rows = collectMedia(res.results);
+    // youtubei.js@18's Search object has no top-level `.results` — media
+    // sits under `.contents`, an array of MusicShelf nodes that themselves
+    // have `.contents`. collectMedia already recurses through both
+    // `.contents` and `.results` on whatever it's handed, so passing the
+    // whole object in (rather than a specific sub-property) is both
+    // correct today and more resilient to the next shape shuffle.
+    const rows = collectMedia(res);
     log.debug('searchYouTube: raw video search rows', { query, rowCount: rows.length });
     for (const row of rows) {
       const mapped = asItem(row, 'video');
@@ -137,7 +154,11 @@ export async function searchYouTube(query, { type = 'all' } = {}) {
   try {
     const musicEnd = log.time('yt.music.search (song)', { query });
     const m = await yt.music.search(query, { type: 'song'});
-    const rows = collectMedia(m.songs?.contents).concat(collectMedia(m.videos?.contents));
+    // Same shape change as above — no `.songs`/`.videos` sub-collections
+    // on the returned object anymore, just `.contents` shelves. Individual
+    // rows still carry their own `item_type` ('song' vs 'video'), which is
+    // what the loop below already branches on.
+    const rows = collectMedia(m);
     log.debug('searchYouTube: raw music search rows', { query, rowCount: rows.length });
     for (const row of rows) {
       const mapped = asItem(row, row.item_type === 'video' ? 'video' : 'song');
@@ -167,10 +188,12 @@ export async function getVideoDetails(youtubeId) {
   const end = log.time('getVideoDetails', { youtubeId });
   const yt = await innertube();
   const info = await yt.getBasicInfo(youtubeId);
+  const full = await yt.music.getInfo(youtubeId);
   const basic = info.basic_info || {};
   const rawTitle = basic.title || '';
   const channel = basic.author || basic.channel?.name || '';
   const parsed = parseArtistTitle(rawTitle, channel);
+  const musicVideoType = full.tabs?.[0]?.content?.content?.contents?.[0]?.endpoint?.payload?.watchEndpointMusicSupportedConfigs?.watchEndpointMusicConfig.music_video_type || null;
   end({ rawTitle, channel });
   return {
     id: `youtube:${youtubeId}`,
@@ -188,6 +211,7 @@ export async function getVideoDetails(youtubeId) {
     view_count: basic.view_count || null,
     is_live: Boolean(basic.is_live),
     channel_id: basic.channel_id || null,
+    music_video_type: musicVideoType,
   };
 }
 
