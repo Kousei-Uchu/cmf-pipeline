@@ -41,7 +41,7 @@ To let other devices on your LAN hit export URLs, set `HOST=0.0.0.0` in `.env`.
 1. Search (Innertube + optional Spotify) or paste a URL (YouTube, Spotify, or anything yt-dlp understands).
 2. Select a result. Albums / playlists / artists expand to tracks.
 3. Choose **Audio only**, **Video only**, or **Audio and video**.
-4. Confirm. The server downloads, converts to `.mp3` / `.mp4`, pulls covers and artist images, writes `info.json`, and zips a `.cmf`.
+4. Confirm. The server downloads, converts to `.mp3` / `.webm`, pulls covers and artist images, writes `info.json`, and zips a `.cmf`.
 5. Download the file, copy a short-lived export URL, or (if the archive is under 25MB) copy a `data:` URL.
 
 Automated search:
@@ -58,7 +58,7 @@ Same contract as the UI. URL queries resolve and expand playlists/albums.
 /{item_title}_{item_author}/
   info.json
   audio/          # .mp3 when requested
-  video/          # .mp4 when requested
+  video/          # .webm when requested (AV1/Opus, matched to source bitrate — see Matching)
   assets/         # cover, artist image, …
 ```
 
@@ -81,6 +81,12 @@ If `GENIUS_ACCESS_TOKEN` is set, video selection asks [Genius](https://genius.co
 - **Genius has no usable answer** (not configured, no song match, no YouTube media, or an MV may exist but none of its linked uploads survived the `- Topic` filter) — falls back to the weighted YouTube search unchanged.
 
 Either way, once a video candidate is chosen it goes through the same download → video-stream check → audio-only fallback safety net as before.
+
+### Video encoding
+
+Downloaded video is remuxed to `.webm` (stream-copied when the source codec already fits the container; otherwise re-encoded to AV1/Opus). The re-encode uses CRF 20 (constant-quality, override with `AV1_CRF`) rather than a fixed bitrate — CRF adapts bits-per-frame to scene complexity, which is what buys real space savings without a visible quality drop: simple scenes cost fewer bits, busy ones cost more. 18-22 is the range most SVT-AV1 testing calls visually transparent; music videos tend to hold up fine at the higher end of that. Audio re-encodes to Opus at 128k (override with `OPUS_BITRATE`), already considered transparent for stereo music.
+
+By default the re-encode runs on `libsvtav1` — software, CPU-only, works everywhere. If you have an RTX 40-series+ GPU **and the server itself is running on that machine** (subprocess calls aren't remote), set `AV1_ENCODER=av1_nvenc` to use the hardware AV1 encoder instead — roughly an order of magnitude faster, at some compression-efficiency cost (comparable quality target, somewhat larger files than software AV1). Requires an ffmpeg build with NVENC support compiled in; most prebuilt Windows/Linux builds have it, Apple Silicon builds don't. `AV1_PRESET` controls the speed/quality tradeoff within whichever encoder is active — the scales aren't comparable between them (`libsvtav1`: `0` slowest/best → `13` fastest/worst, default `4`; `av1_nvenc`: `p1` fastest/worst → `p7` slowest/best, default `p5`).
 
 ## Logging
 

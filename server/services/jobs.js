@@ -9,7 +9,7 @@ import { findOfficialVideoViaGenius, geniusConfigured } from '../lib/genius.js';
 import { ytSearch, downloadMedia, audioFormatArgs, videoFormatArgs, outputPath } from './ytdlp.js';
 import {
   toMp3,
-  remuxMp4,
+  remuxWebm,
   extractPcmEnvelope,
   envelopeCorrelation,
   findNewestMedia,
@@ -426,9 +426,9 @@ async function processItem(job, raw, staged, folder, mode, index) {
           matchNotes.video = { ...matchNotes.video, rejected_audio_only: rejected };
         }
 
-        const dest = path.join(videoDir, `${folder}.mp4`);
-        await remuxMp4(src, dest);
-        videoRel = `/${folder}/video/${folder}.mp4`;
+        const dest = path.join(videoDir, `${folder}.webm`);
+        await remuxWebm(src, dest);
+        videoRel = `/${folder}/video/${folder}.webm`;
       }
     } // end videoPick.skip / weighted-search else branch
   }

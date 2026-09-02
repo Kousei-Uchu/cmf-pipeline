@@ -64,24 +64,72 @@ export async function remuxMp4(inputPath, outputPath) {
   }
 }
 
+// Which AV1 encoder toWebm() uses.
+//  - 'libsvtav1' (default): software, CPU-only. Works everywhere, but slow
+//    at quality-leaning presets — see AV1_PRESET below.
+//  - 'av1_nvenc': hardware AV1 encoder on RTX 40-series+ GPUs. An order of
+//    magnitude faster, at some compression-efficiency cost vs software
+//    (comparable quality target, somewhat larger files). Requires this
+//    process's ffmpeg to actually be running on the machine with the GPU
+//    (subprocess execution isn't remote), and an ffmpeg build with NVENC
+//    support compiled in — most prebuilt Windows/Linux builds have it,
+//    Apple Silicon builds don't (no NVENC hardware to support).
+const AV1_ENCODER = process.env.AV1_ENCODER || 'libsvtav1';
+
+// Quality knob shared across encoders — libsvtav1's -crf and av1_nvenc's
+// -cq are both roughly "lower = higher quality/bigger file", though the
+// two scales aren't perfectly equivalent. 18-22 is a reasonable
+// transparent range on either; override via env if 20 isn't right for
+// your content. True lossless would come out *larger* than the (already
+// lossy) source, so that's never the goal here.
+const AV1_CRF = process.env.AV1_CRF ?? '20';
+
+// Encoder preset. The scales are completely different per encoder —
+// libsvtav1 runs 0 (slowest/best) to 13 (fastest/worst); av1_nvenc runs
+// p1 (fastest/worst) to p7 (slowest/best) — so this only has a sane
+// default once AV1_ENCODER is known: 4 for libsvtav1 (quality-leaning),
+// p5 for av1_nvenc (hardware's already fast, so lean toward quality
+// rather than taking the fastest preset by default).
+const AV1_PRESET = process.env.AV1_PRESET || (AV1_ENCODER === 'av1_nvenc' ? 'p5' : '4');
+
+const OPUS_BITRATE = process.env.OPUS_BITRATE ?? '128k'; // transparent for stereo music
+
 export async function toWebm(inputPath, outputPath) {
+  const isNvenc = AV1_ENCODER === 'av1_nvenc';
+  const videoArgs = isNvenc
+    ? [
+        '-c:v', 'av1_nvenc',
+        '-preset', AV1_PRESET,
+        '-rc', 'vbr',
+        '-cq', AV1_CRF,
+        '-b:v', '0', // required alongside -cq, or NVENC targets a default bitrate instead of quality
+      ]
+    : [
+        '-c:v', 'libsvtav1',
+        '-crf', AV1_CRF,
+        '-preset', AV1_PRESET,
+      ];
+  // 10-bit prevents banding at no size cost, but the pixel format name
+  // differs by encoder: software AV1 takes yuv420p10le directly, NVENC
+  // wants its 10-bit format p010le.
+  const pixFmt = isNvenc ? 'p010le' : 'yuv420p10le';
+
   await run(
     bin(),
     [
       '-y',
       '-i', inputPath,
-      '-c:v', 'libsvtav1',   // Switched from VP9 to AV1
-      '-crf', '35',          // AV1 scales differently; 35 is highly compressed but clean
-      '-preset', '4',        // 4 gives an excellent quality-to-size compression ratio
-      '-pix_fmt', 'yuv420p10le', // 10-bit color reduces file size and prevents color banding
+      ...videoArgs,
+      '-pix_fmt', pixFmt,
       '-c:a', 'libopus',
-      '-b:a', '128k',        // 128k Opus is virtually transparent for stereo music
+      '-b:a', OPUS_BITRATE,
       outputPath,
     ],
     { timeoutMs: 30 * 60_000 },
   );
   return outputPath;
 }
+
 
 
 export async function remuxWebm(inputPath, outputPath) {
