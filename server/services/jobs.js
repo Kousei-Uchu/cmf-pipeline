@@ -18,6 +18,9 @@ import {
 import { rankCandidates, scoreCandidate } from './matcher.js';
 import { enrichAlbumAndArtist, pickImage, spotifyConfigured } from './spotify.js';
 import { downloadBinary, extFromUrl, packCmf, writeJson } from './cmf.js';
+import { child } from '../lib/logger.js';
+
+const log = child('jobs');
 
 const jobs = new Map();
 
@@ -268,6 +271,7 @@ async function processItem(job, raw, staged, folder, mode, index) {
   if (wantVideo) {
     emit(job, { type: 'phase', item: index, phase: 'video', message: 'Matching music video' });
     const videoPick = await pickVideoSource(raw, { ...target, intent: 'video' });
+    log.debug('Video pick', { title, videoPick });
 
     if (videoPick.skip) {
       // Genius confirmed no official MV exists for this song — don't run it
@@ -609,8 +613,14 @@ async function pickVideoSource(raw, target) {
   let genius = null;
   try {
     genius = await findOfficialVideoViaGenius(query, { innertube });
-  } catch {
-    genius = null; // any Genius/Innertube error is treated as "couldn't help"
+    log.debug('Genius video lookup', { query, genius });
+  } catch (err) {
+    log.error('Genius lookup threw', {
+      query,
+      message: err?.message,
+      stack: err?.stack,
+    });
+    genius = null;
   }
 
   if (genius?.noMV) {

@@ -6,4 +6,5 @@ exports/*
 *.cmf
 .DS_Store
 npm-debug.log*
+*.log
 package-lock.json
